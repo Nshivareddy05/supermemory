@@ -27,6 +27,14 @@ class LocalMemorySystem:
             embedding_function=self.embedding_fn,
             metadata={"hnsw:space": "cosine"}
         )
+        
+        # New: Facts collection for specific user-defined QA pairs
+        self.facts_collection = self.client.get_or_create_collection(
+            name="facts",
+            embedding_function=self.embedding_fn,
+            metadata={"hnsw:space": "cosine"}
+        )
+        
         self.threshold = threshold
 
     def fallback_keyword_extraction(self, text: str) -> str:
@@ -48,7 +56,48 @@ class LocalMemorySystem:
         except FileNotFoundError:
             return "Error: Ollama is not installed or not in PATH."
 
+    def add_fact(self, question: str, answer: str) -> None:
+        """Adds a specific fact to the database."""
+        self.facts_collection.add(
+            documents=[question],
+            metadatas=[{"answer": answer}],
+            ids=[str(uuid.uuid4())]
+        )
+
+    def get_all_facts(self) -> list:
+        """Retrieves all facts."""
+        results = self.facts_collection.get()
+        facts = []
+        if results and results.get("documents"):
+            for i, doc in enumerate(results["documents"]):
+                facts.append({
+                    "id": results["ids"][i],
+                    "question": doc,
+                    "answer": results["metadatas"][i]["answer"]
+                })
+        return facts
+        
+    def delete_fact(self, fact_id: str) -> None:
+        """Deletes a fact by ID."""
+        self.facts_collection.delete(ids=[fact_id])
+
     def query(self, prompt: str) -> dict:
+        # 1. Search Facts first (prioritize exact/close matches)
+        fact_results = self.facts_collection.query(
+            query_texts=[prompt],
+            n_results=1
+        )
+        
+        if fact_results and fact_results['distances'] and len(fact_results['distances'][0]) > 0:
+            distance = fact_results['distances'][0][0]
+            if distance <= self.threshold:
+                return {
+                    "response": fact_results['metadatas'][0][0]['answer'],
+                    "source": "fact",
+                    "distance": distance
+                }
+
+        # 2. Search Conversation Cache
         results = self.collection.query(
             query_texts=[prompt],
             n_results=1
@@ -59,7 +108,7 @@ class LocalMemorySystem:
             if distance <= self.threshold:
                 return {
                     "response": results['metadatas'][0][0]['response'],
-                    "is_cached": True,
+                    "source": "memory",
                     "distance": distance
                 }
         
@@ -74,9 +123,43 @@ class LocalMemorySystem:
         
         return {
             "response": response,
-            "is_cached": False,
+            "source": "ollama",
             "distance": None
         }
+
+    def export_data(self) -> dict:
+        """Exports Chromadb facts and conversations."""
+        return {
+            "facts": self.get_all_facts(),
+            "conversations": self.collection.get()
+        }
+
+    def import_data(self, data: dict) -> None:
+        """Imports Chromadb facts and conversations."""
+        if "facts" in data:
+            for fact in data["facts"]:
+                try:
+                    self.facts_collection.add(
+                        documents=[fact["question"]],
+                        metadatas=[{"answer": fact["answer"]}],
+                        ids=[fact["id"]]
+                    )
+                except Exception:
+                    pass # Ignore if exists
+
+        if "conversations" in data:
+            convs = data["conversations"]
+            if convs and convs.get("documents"):
+                # We can't insert all at once easily due to existing ones potentially throwing errors
+                for i, doc in enumerate(convs["documents"]):
+                    try:
+                        self.collection.add(
+                            documents=[doc],
+                            metadatas=[convs["metadatas"][i]],
+                            ids=[convs["ids"][i]]
+                        )
+                    except Exception:
+                        pass # Ignore if exists
 
 def main():
     parser = argparse.ArgumentParser(description="Local AI Memory System CLI")
@@ -103,11 +186,13 @@ def main():
                 progress.add_task(description="Thinking...", total=None)
                 result = system.query(user_input)
             
-            from_cache = result['is_cached']
+            source = result.get('source', '')
             response_text = result['response']
             
-            if from_cache:
-                console.print(f"[bold yellow]⚡ Retrieved from memory (distance: {result['distance']:.4f})[/bold yellow]")
+            if source == "fact":
+                console.print(f"[bold green]⚡ Retrieved from Facts DB (distance: {result['distance']:.4f})[/bold green]")
+            elif source == "memory":
+                console.print(f"[bold yellow]⚡ Retrieved from Memory Cache (distance: {result['distance']:.4f})[/bold yellow]")
             else:
                 console.print("[dim]🧠 Generated by Mistral[/dim]")
                 
